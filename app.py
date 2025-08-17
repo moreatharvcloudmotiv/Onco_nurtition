@@ -2,12 +2,46 @@ import os
 import json
 import pandas as pd
 import streamlit as st
+import asyncio
+import nest_asyncio
+import threading
 from dotenv import load_dotenv
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Qdrant
 from langchain_google_genai import GoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 import qdrant_client
+
+# Fix for asyncio event loop issues in Streamlit
+def setup_asyncio():
+    """Setup asyncio event loop for the current thread"""
+    try:
+        # Apply nest_asyncio to allow nested event loops
+        nest_asyncio.apply()
+    except:
+        pass
+    
+    try:
+        # Try to get the current event loop
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("Event loop is closed")
+    except RuntimeError:
+        # Create a new event loop for this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        # Store loop in thread for later reference
+        threading.current_thread().loop = loop
+    except Exception as e:
+        # Fallback: create new loop
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+        except:
+            pass
+
+# Initialize asyncio setup
+setup_asyncio()
 
 # =========== ENV & PAGE ===========
 load_dotenv()
@@ -275,6 +309,29 @@ def init_session_state():
         st.session_state.chat_context = None
 
 # =========== HELPERS ===========
+def create_qdrant_client():
+    """Create Qdrant client with proper event loop handling"""
+    try:
+        # Ensure asyncio is properly set up
+        setup_asyncio()
+        
+        # Create the Qdrant client
+        client = qdrant_client.QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+        return client
+        
+    except Exception as e:
+        st.error(f"❌ Failed to create Qdrant client: {e}")
+        # Try one more time with a fresh event loop
+        try:
+            import asyncio
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            client = qdrant_client.QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+            return client
+        except Exception as e2:
+            st.error(f"❌ Final attempt failed: {e2}")
+            raise e2
+
 def _safe_json_loads(s: str):
     try:
         start = s.find("{")
@@ -362,7 +419,10 @@ class OncoNutritionRAG:
             raise ValueError("Missing GOOGLE_API_KEY")
 
         self.embedder = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL, google_api_key=api_key)
-        self.client = qdrant_client.QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+        
+        # Use helper function to create Qdrant client with proper event loop handling
+        self.client = create_qdrant_client()
+        
         self.llm = GoogleGenerativeAI(model=LLM_MODEL, temperature=0.25, google_api_key=api_key)
         self.vs = self._get_or_create_vector_store()
 
