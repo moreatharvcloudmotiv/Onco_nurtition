@@ -4,7 +4,6 @@ import pandas as pd
 import streamlit as st
 import asyncio
 import nest_asyncio
-import threading
 from dotenv import load_dotenv
 from langchain.docstore.document import Document
 from langchain.text_splitter import RecursiveCharacterTextSplitter
@@ -13,35 +12,10 @@ from langchain_google_genai import GoogleGenerativeAI, GoogleGenerativeAIEmbeddi
 import qdrant_client
 
 # Fix for asyncio event loop issues in Streamlit
-def setup_asyncio():
-    """Setup asyncio event loop for the current thread"""
-    try:
-        # Apply nest_asyncio to allow nested event loops
-        nest_asyncio.apply()
-    except:
-        pass
-    
-    try:
-        # Try to get the current event loop
-        loop = asyncio.get_event_loop()
-        if loop.is_closed():
-            raise RuntimeError("Event loop is closed")
-    except RuntimeError:
-        # Create a new event loop for this thread
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        # Store loop in thread for later reference
-        threading.current_thread().loop = loop
-    except Exception as e:
-        # Fallback: create new loop
-        try:
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-        except:
-            pass
-
-# Initialize asyncio setup
-setup_asyncio()
+try:
+    nest_asyncio.apply()
+except:
+    pass
 
 # =========== ENV & PAGE ===========
 load_dotenv()
@@ -312,25 +286,20 @@ def init_session_state():
 def create_qdrant_client():
     """Create Qdrant client with proper event loop handling"""
     try:
-        # Ensure asyncio is properly set up
-        setup_asyncio()
-        
-        # Create the Qdrant client
-        client = qdrant_client.QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
-        return client
-        
-    except Exception as e:
-        st.error(f"❌ Failed to create Qdrant client: {e}")
-        # Try one more time with a fresh event loop
+        # Ensure we have an event loop in the current thread
         try:
-            import asyncio
+            loop = asyncio.get_event_loop()
+            if loop.is_closed():
+                raise RuntimeError("Event loop is closed")
+        except RuntimeError:
+            # Create new event loop for this thread
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
-            client = qdrant_client.QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
-            return client
-        except Exception as e2:
-            st.error(f"❌ Final attempt failed: {e2}")
-            raise e2
+        
+        return qdrant_client.QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
+    except Exception as e:
+        st.error(f"Failed to create Qdrant client: {e}")
+        raise e
 
 def _safe_json_loads(s: str):
     try:
@@ -448,16 +417,14 @@ class OncoNutritionRAG:
                 # Enhanced metadata extraction for better retrieval
                 metadata = {
                     "row_id": int(idx),
-                    "cancer_type": str(row.get('CT', '')).lower().strip(),
-                    "cancer_stage": str(row.get('Cancer stage', '')).lower().strip(),
-                    "treatment_stage": str(row.get('Treatment stage', '')).lower().strip(),
-                    "allergies": str(row.get('Allergies', '')).lower().strip(),
-                    "adverse_effects": str(row.get('Adverse effects', '')).lower().strip(),
-                    "feeding_method": str(row.get('Methods', '')).lower().strip(),
-                    "gender": str(row.get('Gender', '')).lower().strip(),
+                    "cancer_type": str(row.get('CT', '')).lower(),
+                    "cancer_stage": str(row.get('Cancer stage', '')).lower(),
+                    "treatment_stage": str(row.get('Treatment stage', '')).lower(),
+                    "allergies": str(row.get('Allergies', '')).lower(),
+                    "adverse_effects": str(row.get('Adverse effects', '')).lower(),
+                    "feeding_method": str(row.get('Methods', '')).lower(),
+                    "gender": str(row.get('Gender', '')).lower(),
                     "age": str(row.get('Age', '')),
-                    "raw_cancer_stage": str(row.get('Cancer stage', '')),  # Keep original format for display
-                    "raw_cancer_type": str(row.get('CT', '')),  # Keep original format for display
                 }
                 
                 docs.append(Document(page_content=content, metadata=metadata))
@@ -477,188 +444,75 @@ class OncoNutritionRAG:
             return vs
 
     def retrieve_context(self, patient_profile: dict, meal_type: str, max_results: int = 8):
-        """Enhanced retrieval that prioritizes cancer type and stage matches with strict filtering"""
+        """Enhanced retrieval that prioritizes cancer type and stage matches"""
         
-        # Step 1: Normalize cancer type to match CSV format exactly
+        # Step 1: Try to find exact cancer type and stage matches first
+        # Normalize cancer type to match CSV format (single word)
         cancer_type_map = {
             'breast cancer': 'breast',
-            'lung cancer': 'lung', 
+            'lung cancer': 'lung',
             'colorectal cancer': 'colorectal',
             'prostate cancer': 'prostate'
         }
         cancer_type_normalized = cancer_type_map.get(patient_profile['cancer_type'].lower(),
                                                      patient_profile['cancer_type'].lower().replace(' cancer', '').replace(' ', ''))
         
-        # Step 2: Normalize stage to match CSV format more precisely
-        stage_input = patient_profile['cancer_stage'].lower()
-        stage_normalized = stage_input
+        # Normalize stage to match CSV format
+        stage_normalized = patient_profile['cancer_stage'].lower().replace(' (early)', '').replace(' (localized)', '').replace(' (regional)', '').replace(' (metastatic)', '').replace(' (in situ)', '')
         
-        # Handle different stage formats that might be in CSV
-        stage_patterns = {
-            'stage 0': ['stage 0', 'stage0', '0', 'in situ'],
-            'stage i': ['stage i', 'stage1', '1', 'stage 1', 'early'],
-            'stage ii': ['stage ii', 'stage2', '2', 'stage 2', 'localized'],
-            'stage iii': ['stage iii', 'stage3', '3', 'stage 3', 'regional'],
-            'stage iv': ['stage iv', 'stage4', '4', 'stage 4', 'metastatic']
-        }
+        # Create hierarchical search queries
+        searches = [
+            # Most specific: exact cancer type + stage + meal type
+            f"CT {cancer_type_normalized} {stage_normalized} {meal_type}",
+            # Cancer type + stage (any meal)
+            f"CT {cancer_type_normalized} {stage_normalized}",
+            # Cancer type + treatment stage
+            f"CT {cancer_type_normalized} {patient_profile['treatment_stage'].lower()}",
+            # Cancer type only
+            f"CT {cancer_type_normalized}",
+            # Treatment stage + symptoms
+            f"{patient_profile['treatment_stage'].lower()} {patient_profile['current_symptoms']}",
+            # Feeding method + general
+            f"{patient_profile['feeding_method'].lower()} {meal_type}",
+        ]
         
-        # Find the best stage match
-        for csv_stage, patterns in stage_patterns.items():
-            for pattern in patterns:
-                if pattern in stage_input.replace(' (early)', '').replace(' (localized)', '').replace(' (regional)', '').replace(' (metastatic)', '').replace(' (in situ)', ''):
-                    stage_normalized = csv_stage
-                    break
-        
-        # Step 3: Hierarchical search with strict filtering
+        # Collect results with scoring
         all_docs = []
         seen_row_ids = set()
         
-        # Priority 1: Exact cancer type + stage + meal type match
-        exact_searches = [
-            f"CT: {cancer_type_normalized} Cancer stage: {stage_normalized} {meal_type}",
-            f"CT: {cancer_type_normalized} Cancer stage: {stage_normalized.replace('stage ', '')} {meal_type}",
-            f"{cancer_type_normalized} {stage_normalized} {meal_type}",
-        ]
-        
-        for query in exact_searches:
+        for priority, query in enumerate(searches):
+            if len(all_docs) >= max_results:
+                break
+                
             try:
-                retriever = self.vs.as_retriever(search_kwargs={"k": 20})
+                retriever = self.vs.as_retriever(search_kwargs={"k": min(max_results*2, 20)})
                 docs = retriever.get_relevant_documents(query)
                 
-                # Filter to ensure exact cancer type and stage match
                 for doc in docs:
-                    if len(all_docs) >= max_results:
-                        break
-                    
                     row_id = doc.metadata.get('row_id')
-                    doc_cancer_type = doc.metadata.get('cancer_type', '').lower()
-                    doc_cancer_stage = doc.metadata.get('cancer_stage', '').lower()
-                    
-                    # Strict matching: both cancer type and stage must match
-                    cancer_type_match = doc_cancer_type == cancer_type_normalized
-                    stage_match = (stage_normalized in doc_cancer_stage or 
-                                 stage_normalized.replace('stage ', '') in doc_cancer_stage or
-                                 doc_cancer_stage in stage_normalized)
-                    
-                    if (row_id not in seen_row_ids and cancer_type_match and stage_match):
-                        doc.metadata['priority_score'] = 10  # Highest priority
+                    if row_id not in seen_row_ids and len(all_docs) < max_results:
+                        # Add priority score to metadata
+                        doc.metadata['priority_score'] = len(searches) - priority
                         doc.metadata['search_query'] = query
-                        doc.metadata['match_type'] = 'EXACT_TYPE_STAGE'
                         all_docs.append(doc)
                         seen_row_ids.add(row_id)
                         
             except Exception as e:
-                st.warning(f"Exact search failed: {query} - {str(e)}")
+                st.warning(f"Search query failed: {query}")
                 continue
         
-        # Priority 2: Exact cancer type match (any stage)
+        # If we still don't have enough, do a broader search
         if len(all_docs) < max_results:
-            cancer_type_searches = [
-                f"CT: {cancer_type_normalized}",
-                f"{cancer_type_normalized} {meal_type}",
-            ]
-            
-            for query in cancer_type_searches:
-                try:
-                    retriever = self.vs.as_retriever(search_kwargs={"k": 15})
-                    docs = retriever.get_relevant_documents(query)
-                    
-                    for doc in docs:
-                        if len(all_docs) >= max_results:
-                            break
-                        
-                        row_id = doc.metadata.get('row_id')
-                        doc_cancer_type = doc.metadata.get('cancer_type', '').lower()
-                        
-                        # Must match cancer type exactly
-                        if (row_id not in seen_row_ids and doc_cancer_type == cancer_type_normalized):
-                            doc.metadata['priority_score'] = 7
-                            doc.metadata['search_query'] = query
-                            doc.metadata['match_type'] = 'EXACT_TYPE'
-                            all_docs.append(doc)
-                            seen_row_ids.add(row_id)
-                            
-                except Exception as e:
-                    continue
-        
-        # Priority 3: Stage match with different cancer types (lower priority)
-        if len(all_docs) < max_results:
-            stage_searches = [
-                f"Cancer stage: {stage_normalized} {meal_type}",
-                f"{stage_normalized} {meal_type}",
-            ]
-            
-            for query in stage_searches:
-                try:
-                    retriever = self.vs.as_retriever(search_kwargs={"k": 10})
-                    docs = retriever.get_relevant_documents(query)
-                    
-                    for doc in docs:
-                        if len(all_docs) >= max_results:
-                            break
-                        
-                        row_id = doc.metadata.get('row_id')
-                        doc_cancer_stage = doc.metadata.get('cancer_stage', '').lower()
-                        
-                        # Must match stage
-                        stage_match = (stage_normalized in doc_cancer_stage or 
-                                     stage_normalized.replace('stage ', '') in doc_cancer_stage or
-                                     doc_cancer_stage in stage_normalized)
-                        
-                        if (row_id not in seen_row_ids and stage_match):
-                            doc.metadata['priority_score'] = 5
-                            doc.metadata['search_query'] = query
-                            doc.metadata['match_type'] = 'EXACT_STAGE'
-                            all_docs.append(doc)
-                            seen_row_ids.add(row_id)
-                            
-                except Exception as e:
-                    continue
-        
-        # Priority 4: Treatment stage and feeding method matches
-        if len(all_docs) < max_results:
-            treatment_searches = [
-                f"{patient_profile['treatment_stage'].lower()} {meal_type}",
-                f"{patient_profile['feeding_method'].lower()} {meal_type}",
-                f"{patient_profile['current_symptoms']} {meal_type}",
-            ]
-            
-            for query in treatment_searches:
-                try:
-                    retriever = self.vs.as_retriever(search_kwargs={"k": 8})
-                    docs = retriever.get_relevant_documents(query)
-                    
-                    for doc in docs:
-                        if len(all_docs) >= max_results:
-                            break
-                        
-                        row_id = doc.metadata.get('row_id')
-                        if row_id not in seen_row_ids:
-                            doc.metadata['priority_score'] = 3
-                            doc.metadata['search_query'] = query  
-                            doc.metadata['match_type'] = 'RELATED'
-                            all_docs.append(doc)
-                            seen_row_ids.add(row_id)
-                            
-                except Exception as e:
-                    continue
-        
-        # Priority 5: General fallback (lowest priority)
-        if len(all_docs) < max_results:
-            fallback_query = f"{meal_type} nutrition cancer"
+            fallback_query = f"{patient_profile['cancer_type']} {meal_type} nutrition"
             try:
                 retriever = self.vs.as_retriever(search_kwargs={"k": max_results})
                 fallback_docs = retriever.get_relevant_documents(fallback_query)
                 
                 for doc in fallback_docs:
-                    if len(all_docs) >= max_results:
-                        break
-                    
                     row_id = doc.metadata.get('row_id')
-                    if row_id not in seen_row_ids:
-                        doc.metadata['priority_score'] = 1
+                    if row_id not in seen_row_ids and len(all_docs) < max_results:
+                        doc.metadata['priority_score'] = 0
                         doc.metadata['search_query'] = fallback_query
-                        doc.metadata['match_type'] = 'GENERAL'
                         all_docs.append(doc)
                         seen_row_ids.add(row_id)
             except Exception:
@@ -670,50 +524,34 @@ class OncoNutritionRAG:
         return all_docs[:max_results]
 
     def generate_custom_recipes(self, patient_profile: dict, meal_type: str, retrieved_docs: list, n_recipes: int = 3):
-        # Organize sources by priority with strict categorization
-        exact_type_stage = [d for d in retrieved_docs if d.metadata.get('match_type') == 'EXACT_TYPE_STAGE']
-        exact_type = [d for d in retrieved_docs if d.metadata.get('match_type') == 'EXACT_TYPE']
-        exact_stage = [d for d in retrieved_docs if d.metadata.get('match_type') == 'EXACT_STAGE']
-        related_sources = [d for d in retrieved_docs if d.metadata.get('match_type') in ['RELATED', 'GENERAL']]
+        # Organize sources by priority for better prompting
+        exact_matches = [d for d in retrieved_docs if d.metadata.get('priority_score', 0) >= 5]
+        good_matches = [d for d in retrieved_docs if 3 <= d.metadata.get('priority_score', 0) < 5]
+        related_sources = [d for d in retrieved_docs if d.metadata.get('priority_score', 0) < 3]
         
         snippets = []
         
-        # Priority 1: Exact cancer type + stage matches (highest priority)
-        if exact_type_stage:
-            snippets.append("=== HIGHEST PRIORITY: EXACT CANCER TYPE + STAGE MATCHES ===")
-            snippets.append(f"Found {len(exact_type_stage)} exact matches for {patient_profile['cancer_type']} {patient_profile['cancer_stage']}:")
-            for d in exact_type_stage:
-                text = d.page_content.strip()
-                if len(text) > 1500:
-                    text = text[:1500] + " …"
-                metadata = d.metadata
-                snippets.append(f"[EXACT TYPE+STAGE MATCH - row_id={metadata.get('row_id','?')} - {metadata.get('raw_cancer_type','')} {metadata.get('raw_cancer_stage','')}]\n{text}")
-        
-        # Priority 2: Exact cancer type matches
-        if exact_type:
-            snippets.append("\n=== HIGH PRIORITY: EXACT CANCER TYPE MATCHES ===")
-            snippets.append(f"Found {len(exact_type)} matches for {patient_profile['cancer_type']}:")
-            for d in exact_type:
+        # Prioritize exact matches
+        if exact_matches:
+            snippets.append("=== EXACT CANCER TYPE/STAGE MATCHES (Priority Sources) ===")
+            for d in exact_matches:
                 text = d.page_content.strip()
                 if len(text) > 1200:
                     text = text[:1200] + " …"
                 metadata = d.metadata
-                snippets.append(f"[EXACT TYPE MATCH - row_id={metadata.get('row_id','?')} - {metadata.get('raw_cancer_type','')} {metadata.get('raw_cancer_stage','')}]\n{text}")
+                snippets.append(f"[EXACT MATCH - row_id={metadata.get('row_id','?')} - {metadata.get('cancer_type','')} {metadata.get('cancer_stage','')}]\n{text}")
         
-        # Priority 3: Exact stage matches (different cancer type)
-        if exact_stage and len(exact_type_stage) < 2:  # Only use if we don't have enough exact matches
-            snippets.append("\n=== MEDIUM PRIORITY: EXACT STAGE MATCHES ===")
-            snippets.append(f"Found {len(exact_stage)} matches for {patient_profile['cancer_stage']}:")
-            for d in exact_stage[:2]:  # Limit stage matches
+        if good_matches:
+            snippets.append("\n=== GOOD MATCHES ===")
+            for d in good_matches:
                 text = d.page_content.strip()
                 if len(text) > 1000:
                     text = text[:1000] + " …"
                 metadata = d.metadata
-                snippets.append(f"[EXACT STAGE MATCH - row_id={metadata.get('row_id','?')} - {metadata.get('raw_cancer_type','')} {metadata.get('raw_cancer_stage','')}]\n{text}")
+                snippets.append(f"[GOOD MATCH - row_id={metadata.get('row_id','?')} - {metadata.get('cancer_type','')}]\n{text}")
         
-        # Priority 4: Related sources (only if we need more context)
-        if related_sources and len(exact_type_stage) + len(exact_type) < 3:
-            snippets.append("\n=== LOW PRIORITY: RELATED SOURCES ===")
+        if related_sources and len(snippets) < 3:  # Only use related if we don't have enough good matches
+            snippets.append("\n=== RELATED SOURCES ===")
             for d in related_sources[:2]:  # Limit related sources
                 text = d.page_content.strip()
                 if len(text) > 800:
@@ -728,39 +566,34 @@ class OncoNutritionRAG:
         }
 
         system_prompt = f"""
-You are a clinical nutrition assistant specializing in oncology. Create {meal_type.upper()} recipes specifically for this patient.
+You are a clinical nutrition assistant specializing in oncology. Create {meal_type.upper()} recipes specifically.
 
-PATIENT CONTEXT (HIGHEST PRIORITY):
-- Cancer Type: {patient_profile['cancer_type']} 
-- Cancer Stage: {patient_profile['cancer_stage']}
-- Feeding Method: {patient_profile['feeding_method']}
-- Treatment Stage: {patient_profile['treatment_stage']}
+PATIENT CONTEXT:
+- Feeding method: {patient_profile['feeding_method']}
+- Cancer type: {patient_profile['cancer_type']} ({patient_profile['cancer_stage']})
 - Treatments: {', '.join(patient_profile.get('treatment_types', []))}
-- Physical Health: {patient_profile['physical_health']}
-- Mental Health: {patient_profile['mental_health']}
-- Current Symptoms: {patient_profile['current_symptoms']}
+- Physical health: {patient_profile['physical_health']}
+- Mental health: {patient_profile['mental_health']}
+- Current symptoms: {patient_profile['current_symptoms']}
 
 MEAL TYPE GUIDANCE: {meal_guidance.get(meal_type, "")}
 
-CRITICAL INSTRUCTIONS:
-1. PRIORITIZE EXACT MATCHES: Use "HIGHEST PRIORITY: EXACT CANCER TYPE + STAGE MATCHES" sources FIRST as they are most relevant
-2. ALL recipes MUST be suitable for {patient_profile['feeding_method']}
-3. Consider dietary restrictions: {', '.join(patient_profile.get('dietary_restrictions', []))}
-4. Avoid allergens: {patient_profile.get('allergies_str', 'none')}
-5. Base recipes ONLY on the provided context - do NOT create recipes from general knowledge
+CRITICAL ADAPTATIONS:
+- ALL recipes MUST be suitable for {patient_profile['feeding_method']}
+- Consider dietary restrictions: {', '.join(patient_profile.get('dietary_restrictions', []))}
+- Avoid allergens: {patient_profile.get('allergies_str', 'none')}
 
-RECIPE ADAPTATION REQUIREMENTS:
-- Adapt ALL ingredients and methods for {patient_profile['feeding_method']}
-- Consider {patient_profile['cancer_stage']} stage nutritional needs
-- Address {patient_profile['current_symptoms']} symptoms through recipe choices
+PRIORITIZE EXACT MATCHES: Use the "EXACT CANCER TYPE/STAGE MATCHES" sources first as they are most relevant to this patient's condition.
+
+Base your recipes ONLY on the provided context. Create NEW, CUSTOMIZED {meal_type} recipes that are safe and practical.
 
 Return STRICT JSON in this schema:
 {{
-  "patient_summary": "1-3 sentence summary for this {meal_type} considering exact cancer type/stage match and feeding method",
+  "patient_summary": "1-3 sentence summary for this {meal_type} considering feeding method",
   "recipes": [
     {{
       "name": "string (include meal type in name)",
-      "servings": "string or number", 
+      "servings": "string or number",
       "prep_time": "e.g., 10 min",
       "cook_time": "e.g., 15 min",
       "total_time": "e.g., 25 min",
@@ -769,27 +602,27 @@ Return STRICT JSON in this schema:
       "nutrition": {{
         "calories": "approx per serving",
         "protein": "g",
-        "carbs": "g", 
+        "carbs": "g",
         "fat": "g",
         "fiber": "g",
         "notes": "micronutrients note"
       }},
-      "goal_alignment": "how this {meal_type} supports {patient_profile['cancer_type']} {patient_profile['cancer_stage']} patient with {patient_profile['feeding_method']}",
+      "goal_alignment": "how this {meal_type} supports the patient's specific condition and feeding method",
       "adaptations": ["modifications for {patient_profile['feeding_method']}", "texture modifications", "dietary restrictions handling"],
-      "contraindications": "what to avoid considering {patient_profile['cancer_type']} {patient_profile['cancer_stage']} and feeding method or 'none known'"
+      "contraindications": "what to avoid considering feeding method or 'none known'"
     }}
   ]
 }}
 """
 
         patient_block = json.dumps(patient_profile, ensure_ascii=False, indent=2)
-        context_block = "\n\n".join(snippets) if snippets else "NO CONTEXT FOUND - UNABLE TO GENERATE RECIPES"
+        context_block = "\n\n".join(snippets) if snippets else "NO CONTEXT"
 
         user_prompt = f"""
 PATIENT PROFILE:
 {patient_block}
 
-RETRIEVED CONTEXT (PRIORITIZED BY RELEVANCE):
+RETRIEVED CONTEXT:
 {context_block}
 """
 
@@ -1167,35 +1000,18 @@ def screen_results():
         with tab:
             result = data['result']
             
-            # Show matching statistics with new priority system
+            # Show matching statistics
             if data['context']:
-                exact_type_stage = sum(1 for doc in data['context'] if doc.metadata.get('match_type') == 'EXACT_TYPE_STAGE')
-                exact_type = sum(1 for doc in data['context'] if doc.metadata.get('match_type') == 'EXACT_TYPE')
-                exact_stage = sum(1 for doc in data['context'] if doc.metadata.get('match_type') == 'EXACT_STAGE')
-                related = sum(1 for doc in data['context'] if doc.metadata.get('match_type') in ['RELATED', 'GENERAL'])
+                exact_matches = sum(1 for doc in data['context'] if doc.metadata.get('priority_score', 0) >= 5)
+                good_matches = sum(1 for doc in data['context'] if 3 <= doc.metadata.get('priority_score', 0) < 5)
                 total_sources = len(data['context'])
                 
-                if exact_type_stage > 0:
-                    st.success(f"🎯 Found {exact_type_stage} exact cancer type + stage matches out of {total_sources} sources")
-                elif exact_type > 0:
-                    st.info(f"✅ Found {exact_type} exact cancer type matches out of {total_sources} sources")
-                elif exact_stage > 0:
-                    st.warning(f"⚠️ Found {exact_stage} exact stage matches (different cancer types) out of {total_sources} sources")
+                if exact_matches > 0:
+                    st.success(f"🎯 Found {exact_matches} exact cancer type/stage matches out of {total_sources} sources")
+                elif good_matches > 0:
+                    st.info(f"✅ Found {good_matches} good matches out of {total_sources} sources")
                 else:
-                    st.warning(f"🔍 Using {related} related sources (no exact cancer type/stage matches found)")
-                
-                # Show breakdown
-                if exact_type_stage + exact_type + exact_stage > 0:
-                    match_details = []
-                    if exact_type_stage > 0:
-                        match_details.append(f"{exact_type_stage} exact type+stage")
-                    if exact_type > 0:
-                        match_details.append(f"{exact_type} exact type")
-                    if exact_stage > 0:
-                        match_details.append(f"{exact_stage} exact stage")
-                    if related > 0:
-                        match_details.append(f"{related} related")
-                    st.caption(f"Match breakdown: {', '.join(match_details)}")
+                    st.warning(f"🔍 Using {total_sources} related sources (no exact cancer type/stage matches found)")
             
             # Patient summary for this meal
             if result.get('patient_summary'):
@@ -1217,62 +1033,20 @@ def screen_results():
                     for i, doc in enumerate(data['context']):
                         priority = doc.metadata.get('priority_score', 0)
                         search_query = doc.metadata.get('search_query', 'Unknown')
-                        match_type = doc.metadata.get('match_type', 'UNKNOWN')
+                        cancer_type = doc.metadata.get('cancer_type', 'unknown')
+                        cancer_stage = doc.metadata.get('cancer_stage', 'unknown')
                         
-                        # Use raw values for display if available, otherwise use processed values
-                        cancer_type_display = doc.metadata.get('raw_cancer_type', doc.metadata.get('cancer_type', 'unknown')).title()
-                        cancer_stage_display = doc.metadata.get('raw_cancer_stage', doc.metadata.get('cancer_stage', 'unknown')).title()
-                        
-                        # Show match quality with new system
-                        match_quality_map = {
-                            'EXACT_TYPE_STAGE': '🎯 Exact Type + Stage',
-                            'EXACT_TYPE': '✅ Exact Type Match',
-                            'EXACT_STAGE': '🔶 Exact Stage Match',
-                            'RELATED': '🔍 Related Match',
-                            'GENERAL': '📋 General Match'
-                        }
-                        match_quality = match_quality_map.get(match_type, f"❓ Unknown ({match_type})")
+                        # Show match quality
+                        match_quality = "🎯 Exact Match" if priority >= 5 else "✅ Good Match" if priority >= 3 else "🔍 Related"
                         
                         st.markdown(f"""
                         **Source #{i+1}** {match_quality} - Priority: {priority}
-                        - **Cancer Type:** {cancer_type_display}
-                        - **Stage:** {cancer_stage_display}
+                        - **Cancer Type:** {cancer_type.title()}
+                        - **Stage:** {cancer_stage.title()}
                         - **Found via:** {search_query}
                         - **Row ID:** `{doc.metadata.get('row_id', 'N/A')}`
                         """)
-                        
-                        # Show more complete content, especially recipe information
-                        content = doc.page_content.strip()
-                        
-                        # If content is very long, try to show the most relevant parts
-                        if len(content) > 1500:
-                            # Look for recipe-related content first
-                            lines = content.split('\n')
-                            recipe_lines = []
-                            other_lines = []
-                            
-                            for line in lines:
-                                line_lower = line.lower()
-                                if any(keyword in line_lower for keyword in ['recipe', 'ingredient', 'preparation', 'method', 'cooking', 'serve']):
-                                    recipe_lines.append(line)
-                                else:
-                                    other_lines.append(line)
-                            
-                            # Prioritize recipe content
-                            if recipe_lines:
-                                display_content = '\n'.join(recipe_lines[:12])  # More recipe lines for exact matches
-                                if other_lines and match_type in ['EXACT_TYPE_STAGE', 'EXACT_TYPE']:
-                                    display_content += '\n...\n' + '\n'.join(other_lines[:8])  # More context for exact matches
-                                elif other_lines:
-                                    display_content += '\n...\n' + '\n'.join(other_lines[:4])
-                            else:
-                                display_content = content[:1500] + "..."
-                        else:
-                            display_content = content
-                        
-                        # Display with better formatting
-                        st.code(display_content, language='text')
-                        
+                        st.code(doc.page_content[:500] + "..." if len(doc.page_content) > 500 else doc.page_content)
                         if i < len(data['context']) - 1:
                             st.divider()
     
