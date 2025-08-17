@@ -445,32 +445,20 @@ class OncoNutritionRAG:
             for idx, row in df.iterrows():
                 content = "\n".join(f"{col}: {val}" for col, val in row.items() if pd.notna(val) and str(val).strip())
                 
-                # Enhanced metadata extraction for better retrieval with better error handling
-                try:
-                    cancer_type_raw = str(row.get('CT', '')).strip()
-                    cancer_stage_raw = str(row.get('Cancer stage', '')).strip()
-                    
-                    metadata = {
-                        "row_id": int(idx),
-                        "cancer_type": cancer_type_raw.lower().strip(),
-                        "cancer_stage": cancer_stage_raw.lower().strip(),
-                        "treatment_stage": str(row.get('Treatment stage', '')).lower().strip(),
-                        "allergies": str(row.get('Allergies', '')).lower().strip(),
-                        "adverse_effects": str(row.get('Adverse effects', '')).lower().strip(),
-                        "feeding_method": str(row.get('Methods', '')).lower().strip(),
-                        "gender": str(row.get('Gender', '')).lower().strip(),
-                        "age": str(row.get('Age', '')),
-                        "raw_cancer_stage": cancer_stage_raw,  # Keep original format for display
-                        "raw_cancer_type": cancer_type_raw,  # Keep original format for display
-                    }
-                    
-                    # Add normalized versions for better matching
-                    metadata["cancer_type_normalized"] = cancer_type_raw.lower().replace(' ', '').strip()
-                    metadata["cancer_stage_normalized"] = cancer_stage_raw.lower().replace(' ', '').replace('stage', '').strip()
-                    
-                except Exception as e:
-                    st.warning(f"Error processing row {idx}: {e}")
-                    continue
+                # Enhanced metadata extraction for better retrieval
+                metadata = {
+                    "row_id": int(idx),
+                    "cancer_type": str(row.get('CT', '')).lower().strip(),
+                    "cancer_stage": str(row.get('Cancer stage', '')).lower().strip(),
+                    "treatment_stage": str(row.get('Treatment stage', '')).lower().strip(),
+                    "allergies": str(row.get('Allergies', '')).lower().strip(),
+                    "adverse_effects": str(row.get('Adverse effects', '')).lower().strip(),
+                    "feeding_method": str(row.get('Methods', '')).lower().strip(),
+                    "gender": str(row.get('Gender', '')).lower().strip(),
+                    "age": str(row.get('Age', '')),
+                    "raw_cancer_stage": str(row.get('Cancer stage', '')),  # Keep original format for display
+                    "raw_cancer_type": str(row.get('CT', '')),  # Keep original format for display
+                }
                 
                 docs.append(Document(page_content=content, metadata=metadata))
 
@@ -521,62 +509,38 @@ class OncoNutritionRAG:
                     stage_normalized = csv_stage
                     break
         
-        # Debug info (only show in development)
-        if st.session_state.get('debug_mode', False):
-            st.write(f"🔍 Debug: Searching for cancer_type='{cancer_type_normalized}', stage='{stage_normalized}'")
-        
-        # Step 3: Hierarchical search with looser initial search, strict filtering
+        # Step 3: Hierarchical search with strict filtering
         all_docs = []
         seen_row_ids = set()
         
-        # Priority 1: Exact cancer type + stage match (with flexible search queries)
+        # Priority 1: Exact cancer type + stage + meal type match
         exact_searches = [
-            # Try exact format matching
-            f"CT: {cancer_type_normalized} Cancer stage: {stage_normalized}",
-            f"CT: {cancer_type_normalized} {stage_normalized}",
-            f"{cancer_type_normalized} {stage_normalized}",
-            # Try with meal type
             f"CT: {cancer_type_normalized} Cancer stage: {stage_normalized} {meal_type}",
+            f"CT: {cancer_type_normalized} Cancer stage: {stage_normalized.replace('stage ', '')} {meal_type}",
             f"{cancer_type_normalized} {stage_normalized} {meal_type}",
-            # Try alternative stage formats
-            f"CT: {cancer_type_normalized} Cancer stage: {stage_normalized.replace('stage ', '')}",
-            f"{cancer_type_normalized} {stage_normalized.replace('stage ', '')}",
         ]
         
         for query in exact_searches:
-            if len(all_docs) >= max_results:
-                break
             try:
-                retriever = self.vs.as_retriever(search_kwargs={"k": 30})  # Increased search to get more candidates
+                retriever = self.vs.as_retriever(search_kwargs={"k": 20})
                 docs = retriever.get_relevant_documents(query)
                 
-                # More flexible filtering - check if cancer type and stage match approximately
+                # Filter to ensure exact cancer type and stage match
                 for doc in docs:
                     if len(all_docs) >= max_results:
                         break
                     
                     row_id = doc.metadata.get('row_id')
-                    if row_id in seen_row_ids:
-                        continue
+                    doc_cancer_type = doc.metadata.get('cancer_type', '').lower()
+                    doc_cancer_stage = doc.metadata.get('cancer_stage', '').lower()
                     
-                    doc_cancer_type = doc.metadata.get('cancer_type', '').lower().strip()
-                    doc_cancer_stage = doc.metadata.get('cancer_stage', '').lower().strip()
+                    # Strict matching: both cancer type and stage must match
+                    cancer_type_match = doc_cancer_type == cancer_type_normalized
+                    stage_match = (stage_normalized in doc_cancer_stage or 
+                                 stage_normalized.replace('stage ', '') in doc_cancer_stage or
+                                 doc_cancer_stage in stage_normalized)
                     
-                    # More flexible matching for cancer type
-                    cancer_type_match = (doc_cancer_type == cancer_type_normalized or 
-                                       cancer_type_normalized in doc_cancer_type or
-                                       doc_cancer_type in cancer_type_normalized)
-                    
-                    # More flexible matching for stage  
-                    stage_match = False
-                    for stage_variant in [stage_normalized, stage_normalized.replace('stage ', ''), stage_normalized.replace(' ', '')]:
-                        if (stage_variant in doc_cancer_stage or 
-                            doc_cancer_stage in stage_variant or
-                            stage_variant == doc_cancer_stage):
-                            stage_match = True
-                            break
-                    
-                    if cancer_type_match and stage_match:
+                    if (row_id not in seen_row_ids and cancer_type_match and stage_match):
                         doc.metadata['priority_score'] = 10  # Highest priority
                         doc.metadata['search_query'] = query
                         doc.metadata['match_type'] = 'EXACT_TYPE_STAGE'
@@ -584,25 +548,19 @@ class OncoNutritionRAG:
                         seen_row_ids.add(row_id)
                         
             except Exception as e:
-                if st.session_state.get('debug_mode', False):
-                    st.warning(f"Search failed: {query} - {str(e)}")
+                st.warning(f"Exact search failed: {query} - {str(e)}")
                 continue
         
-        # Priority 2: Exact cancer type match (more flexible search)
+        # Priority 2: Exact cancer type match (any stage)
         if len(all_docs) < max_results:
             cancer_type_searches = [
                 f"CT: {cancer_type_normalized}",
-                f"CT {cancer_type_normalized}",
-                f"{cancer_type_normalized}",
                 f"{cancer_type_normalized} {meal_type}",
-                f"CT: {cancer_type_normalized} {meal_type}",
             ]
             
             for query in cancer_type_searches:
-                if len(all_docs) >= max_results:
-                    break
                 try:
-                    retriever = self.vs.as_retriever(search_kwargs={"k": 25})
+                    retriever = self.vs.as_retriever(search_kwargs={"k": 15})
                     docs = retriever.get_relevant_documents(query)
                     
                     for doc in docs:
@@ -610,17 +568,10 @@ class OncoNutritionRAG:
                             break
                         
                         row_id = doc.metadata.get('row_id')
-                        if row_id in seen_row_ids:
-                            continue
+                        doc_cancer_type = doc.metadata.get('cancer_type', '').lower()
                         
-                        doc_cancer_type = doc.metadata.get('cancer_type', '').lower().strip()
-                        
-                        # Flexible cancer type matching
-                        cancer_type_match = (doc_cancer_type == cancer_type_normalized or 
-                                           cancer_type_normalized in doc_cancer_type or
-                                           doc_cancer_type in cancer_type_normalized)
-                        
-                        if cancer_type_match:
+                        # Must match cancer type exactly
+                        if (row_id not in seen_row_ids and doc_cancer_type == cancer_type_normalized):
                             doc.metadata['priority_score'] = 7
                             doc.metadata['search_query'] = query
                             doc.metadata['match_type'] = 'EXACT_TYPE'
@@ -630,21 +581,16 @@ class OncoNutritionRAG:
                 except Exception as e:
                     continue
         
-        # Priority 3: Stage match with different cancer types (more flexible)
+        # Priority 3: Stage match with different cancer types (lower priority)
         if len(all_docs) < max_results:
             stage_searches = [
-                f"Cancer stage: {stage_normalized}",
-                f"{stage_normalized}",
-                f"Cancer stage: {stage_normalized.replace('stage ', '')}",
-                f"{stage_normalized.replace('stage ', '')}",
+                f"Cancer stage: {stage_normalized} {meal_type}",
                 f"{stage_normalized} {meal_type}",
             ]
             
             for query in stage_searches:
-                if len(all_docs) >= max_results:
-                    break
                 try:
-                    retriever = self.vs.as_retriever(search_kwargs={"k": 20})
+                    retriever = self.vs.as_retriever(search_kwargs={"k": 10})
                     docs = retriever.get_relevant_documents(query)
                     
                     for doc in docs:
@@ -652,21 +598,14 @@ class OncoNutritionRAG:
                             break
                         
                         row_id = doc.metadata.get('row_id')
-                        if row_id in seen_row_ids:
-                            continue
+                        doc_cancer_stage = doc.metadata.get('cancer_stage', '').lower()
                         
-                        doc_cancer_stage = doc.metadata.get('cancer_stage', '').lower().strip()
+                        # Must match stage
+                        stage_match = (stage_normalized in doc_cancer_stage or 
+                                     stage_normalized.replace('stage ', '') in doc_cancer_stage or
+                                     doc_cancer_stage in stage_normalized)
                         
-                        # Flexible stage matching
-                        stage_match = False
-                        for stage_variant in [stage_normalized, stage_normalized.replace('stage ', ''), stage_normalized.replace(' ', '')]:
-                            if (stage_variant in doc_cancer_stage or 
-                                doc_cancer_stage in stage_variant or
-                                stage_variant == doc_cancer_stage):
-                                stage_match = True
-                                break
-                        
-                        if stage_match:
+                        if (row_id not in seen_row_ids and stage_match):
                             doc.metadata['priority_score'] = 5
                             doc.metadata['search_query'] = query
                             doc.metadata['match_type'] = 'EXACT_STAGE'
@@ -679,18 +618,14 @@ class OncoNutritionRAG:
         # Priority 4: Treatment stage and feeding method matches
         if len(all_docs) < max_results:
             treatment_searches = [
-                f"{patient_profile['treatment_stage'].lower()}",
-                f"{patient_profile['feeding_method'].lower()}",
                 f"{patient_profile['treatment_stage'].lower()} {meal_type}",
                 f"{patient_profile['feeding_method'].lower()} {meal_type}",
                 f"{patient_profile['current_symptoms']} {meal_type}",
             ]
             
             for query in treatment_searches:
-                if len(all_docs) >= max_results:
-                    break
                 try:
-                    retriever = self.vs.as_retriever(search_kwargs={"k": 15})
+                    retriever = self.vs.as_retriever(search_kwargs={"k": 8})
                     docs = retriever.get_relevant_documents(query)
                     
                     for doc in docs:
@@ -708,75 +643,29 @@ class OncoNutritionRAG:
                 except Exception as e:
                     continue
         
-        # Priority 5: General fallback (broader search)
+        # Priority 5: General fallback (lowest priority)
         if len(all_docs) < max_results:
-            fallback_queries = [
-                f"{meal_type} nutrition",
-                f"cancer nutrition {meal_type}",
-                f"oncology {meal_type}",
-                f"{meal_type}"
-            ]
-            
-            for fallback_query in fallback_queries:
-                if len(all_docs) >= max_results:
-                    break
-                try:
-                    retriever = self.vs.as_retriever(search_kwargs={"k": 15})
-                    fallback_docs = retriever.get_relevant_documents(fallback_query)
-                    
-                    for doc in fallback_docs:
-                        if len(all_docs) >= max_results:
-                            break
-                        
-                        row_id = doc.metadata.get('row_id')
-                        if row_id not in seen_row_ids:
-                            doc.metadata['priority_score'] = 1
-                            doc.metadata['search_query'] = fallback_query
-                            doc.metadata['match_type'] = 'GENERAL'
-                            all_docs.append(doc)
-                            seen_row_ids.add(row_id)
-                except Exception:
-                    continue
-        
-        # Final fallback: If we still don't have any docs, try a very broad search
-        if len(all_docs) == 0:
+            fallback_query = f"{meal_type} nutrition cancer"
             try:
-                if st.session_state.get('debug_mode', False):
-                    st.warning("🔍 No results found, trying emergency fallback search...")
+                retriever = self.vs.as_retriever(search_kwargs={"k": max_results})
+                fallback_docs = retriever.get_relevant_documents(fallback_query)
                 
-                emergency_queries = ["breakfast", "lunch", "dinner", "snack", "recipe", "nutrition", "food", "meal"]
-                query_to_try = meal_type if meal_type in emergency_queries else "nutrition"
-                
-                retriever = self.vs.as_retriever(search_kwargs={"k": 20})
-                emergency_docs = retriever.get_relevant_documents(query_to_try)
-                
-                for doc in emergency_docs[:max_results]:
+                for doc in fallback_docs:
+                    if len(all_docs) >= max_results:
+                        break
+                    
                     row_id = doc.metadata.get('row_id')
                     if row_id not in seen_row_ids:
-                        doc.metadata['priority_score'] = 0
-                        doc.metadata['search_query'] = f"EMERGENCY_FALLBACK: {query_to_try}"
-                        doc.metadata['match_type'] = 'EMERGENCY_FALLBACK'
+                        doc.metadata['priority_score'] = 1
+                        doc.metadata['search_query'] = fallback_query
+                        doc.metadata['match_type'] = 'GENERAL'
                         all_docs.append(doc)
                         seen_row_ids.add(row_id)
-                
-                if st.session_state.get('debug_mode', False):
-                    st.info(f"🔍 Emergency fallback found {len(all_docs)} documents")
-                    
-            except Exception as e:
-                if st.session_state.get('debug_mode', False):
-                    st.error(f"🔍 Emergency fallback also failed: {str(e)}")
+            except Exception:
+                pass
         
         # Sort by priority score (higher = better match)
         all_docs.sort(key=lambda x: x.metadata.get('priority_score', 0), reverse=True)
-        
-        # Debug info
-        if st.session_state.get('debug_mode', False):
-            st.write(f"🔍 Debug: Found {len(all_docs)} total documents")
-            match_counts = {}
-            for doc in all_docs:
-                match_type = doc.metadata.get('match_type', 'UNKNOWN')
-                match_counts[match_type] = match_counts.get(match_type, 0) + 1
-            st.write(f"🔍 Debug: Match types: {match_counts}")
         
         return all_docs[:max_results]
 
@@ -1008,14 +897,6 @@ def render_sidebar_navigation():
         for key in list(st.session_state.keys()):
             del st.session_state[key]
         st.rerun()
-    
-    # Debug mode toggle
-    st.sidebar.divider()
-    st.sidebar.subheader("🔧 Debug Tools")
-    debug_mode = st.sidebar.checkbox("Enable Debug Mode", 
-                                    value=st.session_state.get('debug_mode', False),
-                                    help="Show detailed search and matching information")
-    st.session_state.debug_mode = debug_mode
     
     # Debug: Clear cache if needed
     if st.sidebar.button("🗑️ Clear Cache", help="Clear cached RAG system"):
@@ -1300,15 +1181,11 @@ def screen_results():
                     st.info(f"✅ Found {exact_type} exact cancer type matches out of {total_sources} sources")
                 elif exact_stage > 0:
                     st.warning(f"⚠️ Found {exact_stage} exact stage matches (different cancer types) out of {total_sources} sources")
-                elif related > 0:
-                    st.warning(f"🔍 Using {related} related sources (no exact cancer type/stage matches found)")
-                    # Provide helpful message to user
-                    st.info("💡 **Tip:** The system couldn't find exact matches for your cancer type and stage combination. The recipes below are based on related nutritional guidance and have been adapted for your specific needs.")
                 else:
-                    st.error("")
+                    st.warning(f"🔍 Using {related} related sources (no exact cancer type/stage matches found)")
                 
                 # Show breakdown
-                if exact_type_stage + exact_type + exact_stage + related > 0:
+                if exact_type_stage + exact_type + exact_stage > 0:
                     match_details = []
                     if exact_type_stage > 0:
                         match_details.append(f"{exact_type_stage} exact type+stage")
@@ -1319,27 +1196,20 @@ def screen_results():
                     if related > 0:
                         match_details.append(f"{related} related")
                     st.caption(f"Match breakdown: {', '.join(match_details)}")
-            else:
-                st.error("❌ No recipe sources found. This may indicate a database issue.")
-                st.info("🔧 **Troubleshooting:** Try enabling Debug Mode in the sidebar to see more details about the search process.")
             
             # Patient summary for this meal
-            if result and result.get('patient_summary'):
+            if result.get('patient_summary'):
                 st.info(f"💡 **{meal_type.title()} Focus:** {result['patient_summary']}")
             
             # Display recipes
-            recipes = result.get('recipes', []) if result else []
+            recipes = result.get('recipes', [])
             if recipes:
                 for i, recipe in enumerate(recipes):
                     _render_recipe_card(recipe, meal_type)
                     if i < len(recipes) - 1:
                         st.divider()
             else:
-                if data['context']:  # We have sources but no recipes generated
-                    st.warning(f"⚠️ Recipe generation failed for {meal_type}. This may be due to insufficient context or an API issue.")
-                    st.info("🔄 Try regenerating or check your API configuration.")
-                else:
-                    st.warning(f"❌ No {meal_type} recipes were generated due to lack of matching data.")
+                st.warning(f"No {meal_type} recipes were generated.")
             
             # Show context if requested
             if data['context'] and st.session_state.meal_config.get('include_context'):
@@ -1359,8 +1229,7 @@ def screen_results():
                             'EXACT_TYPE': '✅ Exact Type Match',
                             'EXACT_STAGE': '🔶 Exact Stage Match',
                             'RELATED': '🔍 Related Match',
-                            'GENERAL': '📋 General Match',
-                            'EMERGENCY_FALLBACK': '🚨 Emergency Fallback'
+                            'GENERAL': '📋 General Match'
                         }
                         match_quality = match_quality_map.get(match_type, f"❓ Unknown ({match_type})")
                         
