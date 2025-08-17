@@ -254,7 +254,8 @@ st.markdown("""
     }
 </style>""", unsafe_allow_html=True)
 
-QDRANT_URL = "http://localhost:6333"
+QDRANT_URL = os.getenv("QDRANT_URL") 
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY") 
 COLLECTION_NAME = "onco_recipes_google"
 EMBEDDING_MODEL = "models/embedding-001"
 LLM_MODEL = "models/gemini-1.5-flash"
@@ -361,7 +362,7 @@ class OncoNutritionRAG:
             raise ValueError("Missing GOOGLE_API_KEY")
 
         self.embedder = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL, google_api_key=api_key)
-        self.client = qdrant_client.QdrantClient(url=QDRANT_URL)
+        self.client = qdrant_client.QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY)
         self.llm = GoogleGenerativeAI(model=LLM_MODEL, temperature=0.25, google_api_key=api_key)
         self.vs = self._get_or_create_vector_store()
 
@@ -406,6 +407,7 @@ class OncoNutritionRAG:
                 chunks,
                 self.embedder,
                 url=QDRANT_URL,
+                api_key=QDRANT_API_KEY,
                 collection_name=COLLECTION_NAME,
                 force_recreate=True,
             )
